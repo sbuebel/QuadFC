@@ -22,6 +22,8 @@ float alt_difference[3]; // track the last three differences to get a weak PID (
 float alt_p_gain = 10.5;
 float alt_d_gain = 3.5;
 int altitude_hold_throttle;
+float new_alt_from_baro;
+float old_alt_from_baro;
 
 // GPS stuff
 bool use_gps;
@@ -36,9 +38,9 @@ float earth_pole_circ = 40022776; // METERS
 
 // Gyro stuff
 int gyro_x, gyro_y, gyro_z;
-long acc_x, acc_y, acc_z, acc_total_vector, acc_z_offset;
+long acc_x, acc_y, acc_z, acc_total_vector;
 int temperature;
-long gyro_x_cal, gyro_y_cal, gyro_z_cal;
+float gyro_x_cal, gyro_y_cal, gyro_z_cal, acc_z_cal;
 long loop_timer;
 float angle_pitch, angle_roll, angle_yaw;
 int angle_pitch_buffer, angle_roll_buffer, angle_yaw_buffer;
@@ -146,7 +148,7 @@ void setup() {
     digitalWrite(status_led, HIGH);
   } 
   delay(50);
-  Serial.println(receiver_input[2]);
+  //Serial.println(receiver_input[2]);
   // Flash the LED
   for (int i = 0; i < 3; i ++) {
     digitalWrite(status_led, HIGH); delay(50); digitalWrite(status_led, LOW); delay(50);
@@ -192,6 +194,7 @@ void loop() {
   } else if (receiver_input[4] <= 1500) {
     // POS HOLD OFF!
     pos_hold_switch = 0;
+    alt_set_point = 0;
   }
 
   // Position hold algorithm
@@ -202,11 +205,10 @@ void loop() {
       alt_set_point -= 0.01;
     }
     // Update differences, newest is [2], oldest is [0]
-    alt_difference[0] = alt_difference[1];
-    alt_difference[1] = alt_difference[2];
-    alt_difference[2] = alt_set_point - alt; // change in alt required!
-    float alt_dif_avg = 0.5 * (alt_difference[2] - alt_difference[1] + alt_difference[1] - alt_difference[0]);
-    alt_throttle_adjust = (-1*alt_dif_avg*alt_d_gain + alt_difference[2]*alt_p_gain);
+    alt_difference[1] = alt_difference[0];
+    alt_difference[0] = alt_set_point - alt; // change in alt required!
+    float alt_dif_dif = alt_difference[0] - alt_difference[1];
+    alt_throttle_adjust = altitude_hold_throttle + (-1*alt_dif_dif*alt_d_gain + alt_difference[0]*alt_p_gain) - receiver_input[2];
   } else {
     alt_throttle_adjust = 0;
   }
@@ -228,16 +230,8 @@ void loop() {
   if (start == 1 && receiver_input[2] < 1050 && receiver_input[3] > 1450) {
     start = 2; // actually time to fly now
 
-    angle_pitch = angle_pitch_acc;
-    angle_roll = angle_roll_acc;
-    set_gyro_angles = true;
-
-    // Reset accelerometer alt variables
-    alt_velocity = 0;
-    alt_from_accel = alt_from_baro;
-
     // Reset PID stuff for smooth start
-    reset_pid();
+    reset_controller();
   }
 
   // throttle low and yaw far right stops everything!
@@ -264,14 +258,14 @@ void loop() {
 
   pid_yaw_setpoint = 0;
   // make sure throttle is on
-  if (receiver_input[2] > 1050) {
+  if (receiver_input[2] > 1050 || pos_hold_switch == 1) {
     if (receiver_input[3] > 1508) { // YAW YAW YAW
       pid_yaw_setpoint = (receiver_input[3] - 1508) / -3;
     } else if (receiver_input[3] < 1492) {
       pid_yaw_setpoint = (receiver_input[3] - 1492) / -3;
     }
   }
-
+  
   // Now that we have all of our setpoints, calculate actions necessary
   calculate_pid();
 
@@ -286,19 +280,12 @@ void loop() {
      *  Pitch Down: creates positive PID value (move backwards, increase speed of 3, 4)
      */
 
-    if (pos_hold_switch == 0) {
-      // default to throttle level but take into account PID settings!
-      esc_1 = receiver_input[2] - pid_output_pitch + pid_output_roll + pid_output_yaw;
-      esc_2 = receiver_input[2] - pid_output_pitch - pid_output_roll - pid_output_yaw;
-      esc_3 = receiver_input[2] + pid_output_pitch - pid_output_roll + pid_output_yaw;
-      esc_4 = receiver_input[2] + pid_output_pitch + pid_output_roll - pid_output_yaw;
-    } else if (pos_hold_switch == 1) {
-      // default to throttle level but take into account PID settings!
-      esc_1 = altitude_hold_throttle - pid_output_pitch + pid_output_roll + pid_output_yaw + alt_throttle_adjust;
-      esc_2 = altitude_hold_throttle - pid_output_pitch - pid_output_roll - pid_output_yaw + alt_throttle_adjust;
-      esc_3 = altitude_hold_throttle + pid_output_pitch - pid_output_roll + pid_output_yaw + alt_throttle_adjust;
-      esc_4 = altitude_hold_throttle + pid_output_pitch + pid_output_roll - pid_output_yaw + alt_throttle_adjust;
-    }
+    // default to throttle level but take into account PID settings! and pos hold
+    esc_1 = receiver_input[2] - pid_output_pitch + pid_output_roll + pid_output_yaw + alt_throttle_adjust;
+    esc_2 = receiver_input[2] - pid_output_pitch - pid_output_roll - pid_output_yaw + alt_throttle_adjust;
+    esc_3 = receiver_input[2] + pid_output_pitch - pid_output_roll + pid_output_yaw + alt_throttle_adjust;
+    esc_4 = receiver_input[2] + pid_output_pitch + pid_output_roll - pid_output_yaw + alt_throttle_adjust;
+
     // Keep motors running
     int keep_value = 1100;
     if (esc_1 < keep_value) esc_1 = keep_value;
@@ -342,15 +329,28 @@ void loop() {
   read_mpu_6050_data();                                                 // Read the raw acc and gyro data from the MPU-6050
   
   // Get new altitude value (small comp filter)
-  float new_alt = baro.getAltitude();
-  if (abs(alt - new_alt) < 1) { // dont let crazy values mess us up
-    alt = 0.9*alt + 0.1*new_alt;
+  old_alt_from_baro = new_alt_from_baro;
+  new_alt_from_baro = baro.getAltitude();
+  if (abs(old_alt_from_baro - new_alt_from_baro) == 0) { // reset accel stuff if we aren't changing altitude
+    //alt_from_accel = alt_from_baro;
+    alt_velocity /= 2;
+    if (alt_velocity < 0) {
+      acc_z_cal += 0.05*alt_velocity;
+    } else if (alt_velocity > 0) {
+      acc_z_cal += 0.05*alt_velocity;
+    }
   }
-
-  alt_velocity += (acc_z-acc_z_offset) * 0.04; // add accel_z * loop_time!
-  alt_from_accel += alt_velocity * 0.04;
-  alt = 0.5*alt + 0.25*alt_from_baro + 0.25*alt_from_accel;
+  if (abs(old_alt_from_baro - new_alt_from_baro) < 0.5) { // dont let crazy values mess us up
+    alt_from_baro = 0.9*alt_from_baro + 0.1*new_alt_from_baro;
+  }
   
+  // NEED TO FIGURE OUT AN OFFSET VALUE TO MAKE THIS ZERO AT BASELINE! (definitely during gyro calibration...)
+  alt_velocity += ((float)acc_z/4096 - acc_z_cal) * 0.04; // add accel_z * loop_time!
+  alt_from_accel += alt_velocity * 0.04;
+  alt = 0.00*alt + 0.25*alt_from_baro + 0.75*alt_from_accel; // comp filter
+  //Serial.println(alt_velocity);
+  //Serial.println(alt);
+
   //Serial.println(micros() - loop_timer); //debugging, timing stuff
   
   while(PORTD >= 16) {                                              // Stay in this loop until output 4,5,6 and 7 are low (B00010000 = 16 = lowest possible value)
@@ -361,7 +361,6 @@ void loop() {
     if(timer_4 <= esc_loop_timer)PORTD &= B01111111;                // Set digital output 7 to low if the time is expired
   }
 
-  Serial.println(alt_from_accel);
   
   // make caclulations for angles in...
   gyro_signal_in();
@@ -374,7 +373,8 @@ void loop() {
 
 void print_motor_speeds() {
   Serial.print(esc_1); Serial.print(" "); Serial.print(esc_2); Serial.print(" ");
-  Serial.print(esc_3); Serial.print(" "); Serial.println(esc_4);
+  Serial.print(esc_3); Serial.print(" "); Serial.print(esc_4); Serial.print(" ");
+  Serial.print(alt); Serial.print(" "); Serial.println(alt_set_point);
 }
 
 void calculate_pid() { 
@@ -570,7 +570,7 @@ void gyro_signal_in() {
   angle_yaw_output = angle_yaw_output * 0.9 + angle_yaw * 0.1;          // Might as well stick a comp filter on the yaw too!
 }
 
-void reset_pid() {
+void reset_controller() {
   // Reset PID stuff for smooth start
   pid_i_total_roll = 0; 
   pid_last_roll_d_error = 0;
@@ -578,6 +578,16 @@ void reset_pid() {
   pid_last_pitch_d_error = 0;
   pid_i_total_yaw = 0;
   pid_last_yaw_d_error = 0;
+
+  // reset gyro values (no vibration, so accelerometer values should be accurate)
+  angle_pitch = angle_pitch_acc;
+  angle_roll = angle_roll_acc;
+  set_gyro_angles = true;
+    
+  // Reset accelerometer alt variables
+  alt_velocity = 0;
+  alt_from_accel = alt_from_baro;
+
 }
 
 void get_gps_data() {
@@ -606,6 +616,7 @@ void get_gps_data() {
 
 void calibrate_gyro_altimeter_gps() {
   // CALIBRATE GYRO!
+  
   for (int cal_int = 0; cal_int < 2000 ; cal_int ++) {                  // Run this code 2000 times
     if (cal_int % 125 == 0) {
       led_on = !led_on;                                                 // Light up the LED every 125 times
@@ -616,10 +627,10 @@ void calibrate_gyro_altimeter_gps() {
       digitalWrite(status_led, LOW);
     }
     read_mpu_6050_data();                                               // Read the raw acc and gyro data from the MPU-6050
-    gyro_x_cal += gyro_x;                                               // Add the gyro x-axis offset to the gyro_x_cal variable
-    gyro_y_cal += gyro_y;                                               // Add the gyro y-axis offset to the gyro_y_cal variable
-    gyro_z_cal += gyro_z;                                               // Add the gyro z-axis offset to the gyro_z_cal variable
-    acc_z_offset += acc_z;
+    gyro_x_cal += (float)gyro_x;                                               // Add the gyro x-axis offset to the gyro_x_cal variable
+    gyro_y_cal += (float)gyro_y;                                               // Add the gyro y-axis offset to the gyro_y_cal variable
+    gyro_z_cal += (float)gyro_z;                                               // Add the gyro z-axis offset to the gyro_z_cal variable
+    acc_z_cal += (float)acc_z/4096;
     
     // Give ESC's a 1000us pulse
     PORTD |= B11110000;                                                 // Set digital poort 4, 5, 6 and 7 high.
@@ -630,7 +641,7 @@ void calibrate_gyro_altimeter_gps() {
   gyro_x_cal /= 2000;                                                   // Divide the gyro_x_cal variable by 2000 to get the avarage offset
   gyro_y_cal /= 2000;                                                   // Divide the gyro_y_cal variable by 2000 to get the avarage offset
   gyro_z_cal /= 2000;                                                   // Divide the gyro_z_cal variable by 2000 to get the avarage offset
-  acc_z_offset /= 2000;
+  acc_z_cal /= 2000;
 
   // Calibrate altimeter
   for (int cal_int = 0; cal_int < 100; cal_int ++) {
