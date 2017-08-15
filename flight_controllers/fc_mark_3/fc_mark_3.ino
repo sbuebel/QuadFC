@@ -16,17 +16,15 @@
 
 // Position hold stuff
 Adafruit_MPL3115A2 baro = Adafruit_MPL3115A2();
-float alt, zero_alt, alt_set_point, alt_throttle_adjust;
+float alt, alt_from_accel, alt_from_baro, alt_set_point, alt_throttle_adjust, alt_velocity;
 int pos_hold_switch;
 float alt_difference[3]; // track the last three differences to get a weak PID (without I)
 float alt_p_gain = 10.5;
 float alt_d_gain = 3.5;
 int altitude_hold_throttle;
-float alt_velocity;
-float alt_from_accel;
 
 // GPS stuff
-bool use_gps = false;
+bool use_gps;
 TinyGPSPlus gps;
 float gps_latitude, gps_longitude, gps_speed;
 float gps_home_latitude, gps_home_longitude;
@@ -38,7 +36,7 @@ float earth_pole_circ = 40022776; // METERS
 
 // Gyro stuff
 int gyro_x, gyro_y, gyro_z;
-long acc_x, acc_y, acc_z, acc_total_vector;
+long acc_x, acc_y, acc_z, acc_total_vector, acc_z_offset;
 int temperature;
 long gyro_x_cal, gyro_y_cal, gyro_z_cal;
 long loop_timer;
@@ -168,14 +166,13 @@ void setup() {
   gps_home_position[0] = (gps_home_longitude / 180) * 0.5 * earth_equator_circ;
   gps_home_position[1] = (gps_home_latitude / 90) * 0.25 * earth_pole_circ;
   
-  Serial.print(gps_home_latitude, 6);
+  Serial.print(gps_home_position[0], 6);
   Serial.print(" ");
-  Serial.println(gps_home_longitude, 6);
+  Serial.println(gps_home_position[1], 6);
+  Serial.println("Quad is ready.");
 
   loop_timer = micros();                                                // Reset the loop timer
   digitalWrite(status_led, LOW);
-
-  Serial.println("Quad is ready.");
 }
 
 void loop() {
@@ -234,6 +231,10 @@ void loop() {
     angle_pitch = angle_pitch_acc;
     angle_roll = angle_roll_acc;
     set_gyro_angles = true;
+
+    // Reset accelerometer alt variables
+    alt_velocity = 0;
+    alt_from_accel = alt_from_baro;
 
     // Reset PID stuff for smooth start
     reset_pid();
@@ -346,8 +347,9 @@ void loop() {
     alt = 0.9*alt + 0.1*new_alt;
   }
 
-  alt_velocity += acc_z * 0.04; // add accel_z * loop_time!
+  alt_velocity += (acc_z-acc_z_offset) * 0.04; // add accel_z * loop_time!
   alt_from_accel += alt_velocity * 0.04;
+  alt = 0.5*alt + 0.25*alt_from_baro + 0.25*alt_from_accel;
   
   //Serial.println(micros() - loop_timer); //debugging, timing stuff
   
@@ -358,6 +360,8 @@ void loop() {
     if(timer_3 <= esc_loop_timer)PORTD &= B10111111;                // Set digital output 6 to low if the time is expired
     if(timer_4 <= esc_loop_timer)PORTD &= B01111111;                // Set digital output 7 to low if the time is expired
   }
+
+  Serial.println(alt_from_accel);
   
   // make caclulations for angles in...
   gyro_signal_in();
@@ -615,6 +619,7 @@ void calibrate_gyro_altimeter_gps() {
     gyro_x_cal += gyro_x;                                               // Add the gyro x-axis offset to the gyro_x_cal variable
     gyro_y_cal += gyro_y;                                               // Add the gyro y-axis offset to the gyro_y_cal variable
     gyro_z_cal += gyro_z;                                               // Add the gyro z-axis offset to the gyro_z_cal variable
+    acc_z_offset += acc_z;
     
     // Give ESC's a 1000us pulse
     PORTD |= B11110000;                                                 // Set digital poort 4, 5, 6 and 7 high.
@@ -625,10 +630,11 @@ void calibrate_gyro_altimeter_gps() {
   gyro_x_cal /= 2000;                                                   // Divide the gyro_x_cal variable by 2000 to get the avarage offset
   gyro_y_cal /= 2000;                                                   // Divide the gyro_y_cal variable by 2000 to get the avarage offset
   gyro_z_cal /= 2000;                                                   // Divide the gyro_z_cal variable by 2000 to get the avarage offset
+  acc_z_offset /= 2000;
 
   // Calibrate altimeter
   for (int cal_int = 0; cal_int < 100; cal_int ++) {
-    zero_alt += baro.getAltitude();
+    alt_from_baro += baro.getAltitude();
    
     // Give ESC's a 1000us pulse
     PORTD |= B11110000;                                                 // Set digital poort 4, 5, 6 and 7 high.
@@ -636,29 +642,32 @@ void calibrate_gyro_altimeter_gps() {
     PORTD &= B00001111;                                                 // Set digital poort 4, 5, 6 and 7 low.
     delayMicroseconds(3000);                                            // Delay 3000 micros to simulate the 250 Hz program loop
   }
-  zero_alt /= 100;
-  alt = zero_alt; // to start
+  alt_from_baro /= 100;
   pos_hold_switch = 0;
-  alt_from_accel = zero_alt; // start the accel alt at the level of the barometer alt!
+  alt_from_accel = alt_from_baro; // start the accel alt at the level of the barometer alt!
 
   // Get a HOME position for gps stuff
-  if (use_gps == true) {
-    bool get_home_pos = true;
-    while (get_home_pos == true) {
-      if (Serial.available()) {
-        if (gps.encode(Serial.read())) {
-          gps_home_latitude = gps.location.lat();
-          gps_home_longitude = gps.location.lng();
-          if (gps_home_latitude != 0 && gps_home_longitude != 0) {
-            get_home_pos = false;
-          }
+  bool get_home_pos = true;
+  unsigned long gps_pos_attempt = millis();
+  while (get_home_pos == true) {
+    if (Serial.available()) {
+      if (gps.encode(Serial.read())) {
+        gps_home_latitude = gps.location.lat();
+        gps_home_longitude = gps.location.lng();
+        if (gps_home_latitude != 0 && gps_home_longitude != 0) {
+          get_home_pos = false;
+          use_gps = true;
         }
-        // Give ESC's a 1000us pulse
-        PORTD |= B11110000;                                                 // Set digital poort 4, 5, 6 and 7 high.
-        delayMicroseconds(1000);                                            // Wait 1000us.
-        PORTD &= B00001111;                                                 // Set digital poort 4, 5, 6 and 7 low.
-        delayMicroseconds(3000);                                            // Delay 3000 micros to simulate the 250 Hz program loop
       }
+      // Give ESC's a 1000us pulse
+      PORTD |= B11110000;                                                 // Set digital poort 4, 5, 6 and 7 high.
+      delayMicroseconds(1000);                                            // Wait 1000us.
+      PORTD &= B00001111;                                                 // Set digital poort 4, 5, 6 and 7 low.
+      delayMicroseconds(3000);                                            // Delay 3000 micros to simulate the 250 Hz program loop
+    }
+    if (millis() - get_home_pos > 5000) {
+      get_home_pos = false;
+      use_gps = false;
     }
   }
 }
