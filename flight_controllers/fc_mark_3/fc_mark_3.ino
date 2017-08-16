@@ -16,14 +16,12 @@
 
 // Position hold stuff
 Adafruit_MPL3115A2 baro = Adafruit_MPL3115A2();
-float alt, alt_from_accel, alt_from_baro, alt_set_point, alt_throttle_adjust, alt_velocity;
+float alt, alt_from_accel, alt_from_baro, alt_set_point, alt_throttle_adjust, alt_velocity, old_alt_from_baro;
 int pos_hold_switch;
 float alt_difference[3]; // track the last three differences to get a weak PID (without I)
 float alt_p_gain = 10.5;
 float alt_d_gain = 3.5;
 int altitude_hold_throttle;
-float new_alt_from_baro;
-float old_alt_from_baro;
 
 // GPS stuff
 bool use_gps;
@@ -329,25 +327,23 @@ void loop() {
   read_mpu_6050_data();                                                 // Read the raw acc and gyro data from the MPU-6050
   
   // Get new altitude value (small comp filter)
-  old_alt_from_baro = new_alt_from_baro;
-  new_alt_from_baro = baro.getAltitude();
-  if (abs(old_alt_from_baro - new_alt_from_baro) == 0) { // reset accel stuff if we aren't changing altitude
+  old_alt_from_baro = alt_from_baro;
+  alt_from_baro = baro.getAltitude();
+  if (old_alt_from_baro == alt_from_baro) { // reset accel stuff if we aren't changing altitude
     //alt_from_accel = alt_from_baro;
-    alt_velocity /= 2;
+    alt_velocity *= 0.5;
     if (alt_velocity < 0) {
       acc_z_cal += 0.05*alt_velocity;
-    } else if (alt_velocity > 0) {
+    } else {
       acc_z_cal += 0.05*alt_velocity;
     }
   }
-  if (abs(old_alt_from_baro - new_alt_from_baro) < 0.5) { // dont let crazy values mess us up
-    alt_from_baro = 0.9*alt_from_baro + 0.1*new_alt_from_baro;
-  }
   
   // NEED TO FIGURE OUT AN OFFSET VALUE TO MAKE THIS ZERO AT BASELINE! (definitely during gyro calibration...)
-  alt_velocity += ((float)acc_z/4096 - acc_z_cal) * 0.04; // add accel_z * loop_time!
+  //0.00024414062 = 1 / 4096
+  alt_velocity += ((float)acc_z*0.00024414062 - acc_z_cal) * 0.04; // add accel_z * loop_time!
   alt_from_accel += alt_velocity * 0.04;
-  alt = 0.00*alt + 0.25*alt_from_baro + 0.75*alt_from_accel; // comp filter
+  alt = 0.25*alt_from_baro + 0.75*alt_from_accel; // comp filter
   //Serial.println(alt_velocity);
   //Serial.println(alt);
 
@@ -607,8 +603,8 @@ void get_gps_data() {
               
         distance_to_home = gps.distanceBetween(gps_latitude, gps_longitude, gps_home_latitude, gps_home_longitude);
         //distance_to_home = sqrt(pow((gps_position[0] - gps_home_position[0]), 2) + pow((gps_position[1] - gps_home_position[1]), 2));
-        Serial.println(distance_to_home);
-        //Serial.print(gps_latitude); Serial.print(" "); Serial.print(gps_longitude); Serial.print(" "); Serial.println(gps_speed);
+        //Serial.println(distance_to_home);
+        Serial.print(gps_latitude); Serial.print(" "); Serial.print(gps_longitude); Serial.print(" "); Serial.println(gps_speed);
       }
     }
   }
@@ -666,8 +662,11 @@ void calibrate_gyro_altimeter_gps() {
         gps_home_latitude = gps.location.lat();
         gps_home_longitude = gps.location.lng();
         if (gps_home_latitude != 0 && gps_home_longitude != 0) {
+          Serial.print(gps_home_latitude); Serial.print(" "); Serial.println(gps_home_longitude);
           get_home_pos = false;
           use_gps = true;
+        } else {
+          Serial.println("Waiting for GPS signal...");
         }
       }
       // Give ESC's a 1000us pulse
@@ -676,7 +675,7 @@ void calibrate_gyro_altimeter_gps() {
       PORTD &= B00001111;                                                 // Set digital poort 4, 5, 6 and 7 low.
       delayMicroseconds(3000);                                            // Delay 3000 micros to simulate the 250 Hz program loop
     }
-    if (millis() - get_home_pos > 5000) {
+    if (millis() - gps_pos_attempt > 5000) {
       get_home_pos = false;
       use_gps = false;
     }

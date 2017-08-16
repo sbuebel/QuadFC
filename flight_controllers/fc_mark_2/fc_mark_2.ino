@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <TinyGPS++.h>
 #include <Adafruit_MPL3115A2.h>
+#include <NeoSWSerial.h>
 
 // Position hold stuff
 Adafruit_MPL3115A2 baro = Adafruit_MPL3115A2();
@@ -26,6 +27,7 @@ int altitude_hold_throttle;
 // GPS stuff
 bool use_gps = false;
 TinyGPSPlus gps;
+NeoSWSerial neo_serial(2, 3);
 float gps_latitude, gps_longitude, gps_speed;
 float gps_home_latitude, gps_home_longitude;
 float gps_home_position[2]; // keeps track of home x, y, z position
@@ -120,6 +122,10 @@ int receiver_input[5];                                                  // Recei
   ESC4:   Singal -> Digital Pin 7
     [ all ESC's take 3.3 V input and GND ]
 */
+
+void nssPortISR() {
+  NeoSWSerial::rxISR(*portInputRegister(digitalPinToPort(2)));
+}
 
 void setup() {
   Serial.begin(9600);                                                   // Use for debugging and GPS (hopefully)
@@ -573,8 +579,8 @@ void reset_pid() {
 
 void get_gps_data() {
   if (gps_home_latitude != 0) {
-    if (Serial.available()) {
-      if (gps.encode(Serial.read())) {
+    if (neo_serial.available()) {
+      if (gps.encode(neo_serial.read())) {
         gps_latitude = gps.location.lat();
         gps_longitude = gps.location.lng();
         gps_speed = gps.speed.mph();
@@ -588,7 +594,7 @@ void get_gps_data() {
               
         distance_to_home = gps.distanceBetween(gps_latitude, gps_longitude, gps_home_latitude, gps_home_longitude);
         //distance_to_home = sqrt(pow((gps_position[0] - gps_home_position[0]), 2) + pow((gps_position[1] - gps_home_position[1]), 2));
-        Serial.println(distance_to_home);
+        //Serial.println(distance_to_home);
         //Serial.print(gps_latitude); Serial.print(" "); Serial.print(gps_longitude); Serial.print(" "); Serial.println(gps_speed);
       }
     }
@@ -639,8 +645,8 @@ void calibrate_gyro_altimeter_gps() {
   if (use_gps == true) {
     bool get_home_pos = true;
     while (get_home_pos == true) {
-      if (Serial.available()) {
-        if (gps.encode(Serial.read())) {
+      if (neo_serial.available()) {
+        if (gps.encode(neo_serial.read())) {
           gps_home_latitude = gps.location.lat();
           gps_home_longitude = gps.location.lng();
           if (gps_home_latitude != 0 && gps_home_longitude != 0) {

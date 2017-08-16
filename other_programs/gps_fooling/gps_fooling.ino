@@ -1,27 +1,34 @@
 #include <TinyGPS++.h>
-#include <AltSoftSerial.h>
+#include <NeoSWSerial.h>
+#include <EnableInterrupt.h>
 
 TinyGPSPlus gps;
-AltSoftSerial alt_serial;
+NeoSWSerial neo_serial(2, 3);
 
 float x_coordinate, y_coordinate, zero_x_coordinate, zero_y_coordinate;
 float last_x, last_y;
 float r = 3959; // miles!
 float velocity; // mph!
 
+void nssPortISR()
+{
+  NeoSWSerial::rxISR( *portInputRegister( digitalPinToPort(2) ) );
+}
 
 void setup() {
   Serial.begin(9600);
   // put your setup code here, to run once:
-  alt_serial.begin(9600); // Start software serial for GPS at 9600 baud rate (default for GPS)
+  neo_serial.begin(9600); // Start software serial for GPS at 9600 baud rate (default for GPS)
+  enableInterrupt(2, nssPortISR, CHANGE );
 }
 
 void loop() {
   bool got_data = false;
-
+  //Serial.println("LOOP");
   // put your main code here, to run repeatedly:
-  if (alt_serial.available()) {
-    if (gps.encode(alt_serial.read())) {
+  if (neo_serial.available()) {
+    //Serial.println("AVAILABLE");
+    if (gps.encode(neo_serial.read())) {
         //Serial.println(alt_serial.read());
         float latitude = gps.location.lat();
         float longitude = gps.location.lng();
