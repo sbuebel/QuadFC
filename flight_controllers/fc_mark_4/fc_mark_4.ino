@@ -1,18 +1,18 @@
-/* FLIGHT CONTROLLER MARK THREE:
+/* FLIGHT CONTROLLER MARK FOUR:
  *    This is a more complex flight controller which takes inputs from
  *    a GPS and barometer to approximate position and altitude at all times.
- *    Altitude is approximated using a combination of accelerometer and
- *    barometer data. Implementation for altitude and position hold will be 
- *    included in future flight controller versions.
+ *    Implementation for altitude and position hold will be included in
+ *    future flight controller versions.
  */
 
-// Teensy 3.5 is next step - stronger processor and stuff (more Serial ports)
-
+// Try blending results of barometer and accelerometer to get a more precise altitude!
 // Maybe do the same for accelerometer x, y to get an accurate position with GPS?
 
 #include <Wire.h>
-#include <TinyGPS++.h>
-#include <Adafruit_MPL3115A2.h> // Very fast library, might as well use it!
+#include <NMEAGPS.h>
+#include <Adafruit_MPL3115A2.h>
+#include <StandardCplusplus.h>
+#include <vector>
 
 // Position hold stuff
 Adafruit_MPL3115A2 baro = Adafruit_MPL3115A2();
@@ -24,32 +24,32 @@ float alt_d_gain = 3.5;
 int altitude_hold_throttle;
 
 // GPS stuff
-bool use_gps;
-TinyGPSPlus gps;
-float gps_latitude, gps_longitude, gps_speed;
-float gps_home_latitude, gps_home_longitude;
+bool use_gps = true;
+NMEAGPS gps;
+gps_fix fix;
+NeoGPS::Location_t home;
+float distance_to_home;
+int gps_count; // number of gps locations we have so far
+bool got_home_pos = false;
 float gps_home_position[2]; // keeps track of home x, y, z position
 float gps_position[2]; // keeps track of an x, y, z position
-float distance_to_home;
 float earth_equator_circ = 40030823; // METERS - just use these, estimate our portion of the Earth to be flat, and get x,y
 float earth_pole_circ = 40022776; // METERS
+std::vector<std::vector<float>> gps_waypoints;
 
 // Gyro stuff
-int gyro_x, gyro_y, gyro_z;
+int gyro_x, gyro_y, gyro_z, temperature;
 long acc_x, acc_y, acc_z, acc_total_vector;
-int temperature;
 float gyro_x_cal, gyro_y_cal, gyro_z_cal, acc_z_cal;
-long loop_timer;
+long loop_timer, start_time;
 float angle_pitch, angle_roll, angle_yaw;
 int angle_pitch_buffer, angle_roll_buffer, angle_yaw_buffer;
 boolean set_gyro_angles;
 float angle_roll_acc, angle_pitch_acc;
 float angle_pitch_output, angle_roll_output, angle_yaw_output;
 
-// Motor speeds
+// Motor speeds and timers
 int esc_1, esc_2, esc_3, esc_4;
-
-// Motor speed timers
 unsigned long timer_1, timer_2, timer_3, timer_4, esc_loop_timer;
 
 bool led_on;
@@ -114,6 +114,10 @@ int receiver_input[5];                                                  // Recei
         GND -> GND
         SCL -> Analog 5
         SDA -> Analog 4
+  GPS:  RX -> TX
+        TX -> RX
+  BARO: SCL -> Analog 5
+        SDA -> Analog 4
   ESC1:   Signal -> Digital Pin 4
   ESC2:   Singal -> Digital Pin 5
   ESC3:   Signal -> Digital Pin 6
@@ -125,9 +129,7 @@ void setup() {
   Serial.begin(9600);                                                   // Use for debugging and GPS (hopefully)
   Wire.begin();                                                         // Start I2C as master
   baro.begin();                                                         // Start the barometer library (cleaned up)
-  
   TWBR = 12;                                                            // Set the I2C clock speed to 400kHz.
-
   pinMode(status_led, OUTPUT);
 
   // Set all the interrupt pins
@@ -139,93 +141,41 @@ void setup() {
   PCMSK0 |= (1 << PCINT4); // pin 12
 
   setup_mpu_6050_registers();                                           // Setup the registers of the MPU-6050 (500dfs / +/-8g) and start the gyro
-  DDRD |= B11110000;    
+  DDRD |= B11110000; // Set motor pins as outputs
 
-  // Set HIGH and LOW levels for ESCs! (calibrate ESCs)
-  while (receiver_input[2] < 1900) {
-    digitalWrite(status_led, HIGH);
-  } 
-  delay(50);
-  //Serial.println(receiver_input[2]);
-  // Flash the LED
-  for (int i = 0; i < 3; i ++) {
-    digitalWrite(status_led, HIGH); delay(50); digitalWrite(status_led, LOW); delay(50);
-  }
-  for (int i = 0; i < 1500; i ++) {
-    PORTD |= B11110000;                                                 // Set digital port 4, 5, 6 and 7 high.
-    delayMicroseconds(receiver_input[2]);                               // Set HIGH threshold.
-    PORTD &= B00001111;                                                 // Set digital port 4, 5, 6 and 7 low.
-    delayMicroseconds(4000 - receiver_input[2]);
-  }
-  digitalWrite(status_led, LOW);
+  // Get high and low signals from controller
+  set_motor_limits();
+  flash_LED();
 
   // Calibrate everything
   calibrate_gyro_altimeter_gps();
+  flash_LED();
 
-  // Easy way to calc x, y - assume our Earth is flat
-  gps_home_position[0] = (gps_home_longitude / 180) * 0.5 * earth_equator_circ;
-  gps_home_position[1] = (gps_home_latitude / 90) * 0.25 * earth_pole_circ;
-  
-  Serial.print(gps_home_position[0], 6);
-  Serial.print(" ");
-  Serial.println(gps_home_position[1], 6);
-  Serial.println("Quad is ready.");
-
-  loop_timer = micros();                                                // Reset the loop timer
-  digitalWrite(status_led, LOW);
+  loop_timer = micros(); start_time = millis(); // Set loop timer and start time
 }
 
 void loop() {
-  if (use_gps == true) {
+  if (use_gps) {
     // Try to get GPS data in
-    get_gps_data();
-  }
-
-  // Turn on POS HOLD if swivel is above 1500! - only set altitude the first time!
-  if (receiver_input[4] > 1500 && pos_hold_switch == 0) {
-    // POS HOLD ON!
-    pos_hold_switch = 1;
-    alt_set_point = alt;
-    altitude_hold_throttle = receiver_input[2];
-
-  // If POS HOLD swivel is below 1500, turn off POS HOLD
-  } else if (receiver_input[4] <= 1500) {
-    // POS HOLD OFF!
-    pos_hold_switch = 0;
-    alt_set_point = 0;
-  }
-
-  // Position hold algorithm
-  if (pos_hold_switch == 1) { // if alt ctrl is on...
-    if (receiver_input[2] > 1950) {
-      alt_set_point += 0.01;
-    } else if (receiver_input[2] < 1050) {
-      alt_set_point -= 0.01;
+    int waypoint_wait = 5000; // new waypoint every 5 seconds
+    if (millis() - start_time > waypoint_wait) {
+      get_gps_data(true);
+      start_time = millis();
+      print_waypoints();
+    } else {
+      get_gps_data(false);
     }
-    // Update differences, newest is [2], oldest is [0]
-    alt_difference[1] = alt_difference[0];
-    alt_difference[0] = alt_set_point - alt; // change in alt required!
-    float alt_dif_dif = alt_difference[0] - alt_difference[1];
-    alt_throttle_adjust = altitude_hold_throttle + (-1*alt_dif_dif*alt_d_gain + alt_difference[0]*alt_p_gain) - receiver_input[2];
-  } else {
-    alt_throttle_adjust = 0;
   }
-
-  //Serial.println(alt);
-  /*Serial.print(" ");
-  Serial.print(alt_set_point);
-  Serial.print(" ");
-  Serial.println(alt_throttle_adjust);*/
 
   // 65.5 = 1 deg/sec (from MPU-6050 spec sheet) COMPLIMENTARY FILTER
   gyro_roll_input = (gyro_roll_input * 0.7) + ((gyro_x/65.5) * 0.3);    // Gyro PID input is in degrees/second
   gyro_pitch_input = (gyro_pitch_input * 0.7) + ((gyro_y/65.5) * 0.3);
   gyro_yaw_input = (gyro_yaw_input * 0.7) + ((gyro_z/65.5) * 0.3);
   
-  // Throttle bottom, yaw far left
-  if (receiver_input[2] < 1050 && receiver_input[3] < 1050) start = 1;
-
-  if (start == 1 && receiver_input[2] < 1050 && receiver_input[3] > 1450) {
+  if (receiver_input[2] < 1050 && receiver_input[3] < 1050) { // Throttle low, yaw far left
+    start = 1;
+  }
+  if (start == 1 && receiver_input[2] < 1050 && receiver_input[3] > 1450) { // Throttle low, yaw middle
     start = 2; // actually time to fly now
 
     // Reset PID stuff for smooth start
@@ -234,6 +184,13 @@ void loop() {
 
   // throttle low and yaw far right stops everything!
   if (start == 2 && receiver_input[2] < 1050 && receiver_input[3] > 1950) start = 0;
+
+  /* Controller INPUTS:
+   *  Roll Left: creates positive PID value (increase speed of 1, 4)
+   *  Roll Right: creates negative PID value (increase speed of 2, 3)
+   *  Pitch Up: creates negative PID value (move forwards, increase speed of 1, 2)
+   *  Pitch Down: creates positive PID value (move backwards, increase speed of 3, 4)
+   */
   
   // Get controller setpoint! Need this for PID calculations - SETPOINT is in degrees/second!!!
   pid_roll_setpoint = 0;
@@ -269,34 +226,7 @@ void loop() {
 
   // Update motor speeds here
   if (start == 2) {
-    if (receiver_input[2] > 1800) receiver_input[2] = 1800;
-
-    /* Controller INPUTS:
-     *  Roll Left: creates positive PID value (increase speed of 1, 4)
-     *  Roll Right: creates negative PID value (increase speed of 2, 3)
-     *  Pitch Up: creates negative PID value (move forwards, increase speed of 1, 2)
-     *  Pitch Down: creates positive PID value (move backwards, increase speed of 3, 4)
-     */
-
-    // default to throttle level but take into account PID settings! and pos hold
-    esc_1 = receiver_input[2] - pid_output_pitch + pid_output_roll + pid_output_yaw + alt_throttle_adjust;
-    esc_2 = receiver_input[2] - pid_output_pitch - pid_output_roll - pid_output_yaw + alt_throttle_adjust;
-    esc_3 = receiver_input[2] + pid_output_pitch - pid_output_roll + pid_output_yaw + alt_throttle_adjust;
-    esc_4 = receiver_input[2] + pid_output_pitch + pid_output_roll - pid_output_yaw + alt_throttle_adjust;
-
-    // Keep motors running
-    int keep_value = 1100;
-    if (esc_1 < keep_value) esc_1 = keep_value;
-    if (esc_2 < keep_value) esc_2 = keep_value;
-    if (esc_3 < keep_value) esc_3 = keep_value;
-    if (esc_4 < keep_value) esc_4 = keep_value;
-
-    // Keep signals below 2000
-    if (esc_1 > 2000) esc_1 = 2000;
-    if (esc_2 > 2000) esc_2 = 2000;
-    if (esc_3 > 2000) esc_3 = 2000;
-    if (esc_4 > 2000) esc_4 = 2000;
-    
+    update_motor_speeds();
   } else {
     // Turn them all off
     esc_1 = 1000;
@@ -313,38 +243,20 @@ void loop() {
   } else {
     while (micros() - loop_timer < 4000);                             // Wait until the loop_timer reaches 4000us (250Hz) before starting the next loop
   }
-  loop_timer = micros();                                            // Reset the loop timer
 
   // This really becomes the START of the next loop!
+  loop_timer = micros();                                            // Reset the loop timer
   
   PORTD |= B11110000;                                               // Set digital outputs 4,5,6 and 7 high
-  timer_1 = esc_1 + loop_timer;                                     // Calculate the time of the faling edge of the esc-1 pulse
-  timer_2 = esc_2 + loop_timer;                                     // Calculate the time of the faling edge of the esc-2 pulse
-  timer_3 = esc_3 + loop_timer;                                     // Calculate the time of the faling edge of the esc-3 pulse
-  timer_4 = esc_4 + loop_timer;                                     // Calculate the time of the faling edge of the esc-4 pulse
+  timer_1 = esc_1 + loop_timer;                                     // Calculate the time of the falling edge of the esc-1 pulse
+  timer_2 = esc_2 + loop_timer;                                     // Calculate the time of the falling edge of the esc-2 pulse
+  timer_3 = esc_3 + loop_timer;                                     // Calculate the time of the falling edge of the esc-3 pulse
+  timer_4 = esc_4 + loop_timer;                                     // Calculate the time of the falling edge of the esc-4 pulse
  
   // Get values from the gyro
   read_mpu_6050_data();                                                 // Read the raw acc and gyro data from the MPU-6050
   
-  // Get new altitude value (small comp filter)
-  old_alt_from_baro = alt_from_baro;
-  alt_from_baro = baro.getAltitude();
-  if (old_alt_from_baro == alt_from_baro) { // reset accel stuff if we aren't changing altitude
-    //alt_from_accel = alt_from_baro;
-    alt_velocity *= 0.5;
-    if (alt_velocity < 0) {
-      acc_z_cal += 0.05*alt_velocity;
-    } else {
-      acc_z_cal += 0.05*alt_velocity;
-    }
-  }
-  
-  //0.00024414062 = 1 / 4096
-  alt_velocity += ((float)acc_z*0.00024414062 - acc_z_cal) * 0.04; // add accel_z * loop_time!
-  alt_from_accel += alt_velocity * 0.04;
-  alt = 0.25*alt_from_baro + 0.75*alt_from_accel; // comp filter
-  //Serial.println(alt_velocity);
-  //Serial.println(alt);
+  read_altitude_data();
 
   //Serial.println(micros() - loop_timer); //debugging, timing stuff
   
@@ -364,12 +276,125 @@ void loop() {
 
 
 
+void read_altitude_data() {
+  // Get new altitude value (small comp filter)
+  old_alt_from_baro = alt_from_baro;
+  alt_from_baro = baro.getAltitude();
+  if (old_alt_from_baro == alt_from_baro) { // reset accel stuff if we aren't changing altitude
+    //alt_from_accel = alt_from_baro;
+    alt_velocity *= 0.5;
+    if (alt_velocity < 0) {
+      acc_z_cal += 0.05*alt_velocity;
+    } else {
+      acc_z_cal += 0.05*alt_velocity;
+    }
+  }
+  
+  // NEED TO FIGURE OUT AN OFFSET VALUE TO MAKE THIS ZERO AT BASELINE! (definitely during gyro calibration...)
+  //0.00024414062 = 1 / 4096
+  alt_velocity += ((float)acc_z*0.00024414062 - acc_z_cal) * 0.04; // add accel_z * loop_time!
+  alt_from_accel += alt_velocity * 0.04;
+  alt = 0.25*alt_from_baro + 0.75*alt_from_accel; // comp filter
+}
 
+void update_motor_speeds() {
+  if (receiver_input[2] > 1800) receiver_input[2] = 1800;
+
+  // default to throttle level but take into account PID settings! and pos hold
+  esc_1 = receiver_input[2] - pid_output_pitch + pid_output_roll + pid_output_yaw + alt_throttle_adjust;
+  esc_2 = receiver_input[2] - pid_output_pitch - pid_output_roll - pid_output_yaw + alt_throttle_adjust;
+  esc_3 = receiver_input[2] + pid_output_pitch - pid_output_roll + pid_output_yaw + alt_throttle_adjust;
+  esc_4 = receiver_input[2] + pid_output_pitch + pid_output_roll - pid_output_yaw + alt_throttle_adjust;
+
+  // Keep motors running
+  int keep_value = 1100;
+  if (esc_1 < keep_value) esc_1 = keep_value;
+  if (esc_2 < keep_value) esc_2 = keep_value;
+  if (esc_3 < keep_value) esc_3 = keep_value;
+  if (esc_4 < keep_value) esc_4 = keep_value;
+
+  // Keep signals below 2000
+  if (esc_1 > 2000) esc_1 = 2000;
+  if (esc_2 > 2000) esc_2 = 2000;
+  if (esc_3 > 2000) esc_3 = 2000;
+  if (esc_4 > 2000) esc_4 = 2000;
+}
+
+void position_hold() {
+  // See if we want position hold on:
+  if (receiver_input[4] > 1500 && pos_hold_switch == 0) {
+    pos_hold_switch = 1; // POS HOLD ON!
+    alt_set_point = alt;
+    altitude_hold_throttle = receiver_input[2];
+  } else if (receiver_input[4] <= 1500) {
+    pos_hold_switch = 0; // POS HOLD OFF!
+    alt_set_point = 0;
+  }
+
+  // Position hold algorithm
+  if (pos_hold_switch == 1) { // if alt ctrl is on...
+    if (receiver_input[2] > 1950) {
+      alt_set_point += 0.01;
+    } else if (receiver_input[2] < 1050) {
+      alt_set_point -= 0.01;
+    }
+    // Update differences, newest is [2], oldest is [0]
+    alt_difference[1] = alt_difference[0];
+    alt_difference[0] = alt_set_point - alt; // change in alt required!
+    float alt_dif_dif = alt_difference[0] - alt_difference[1];
+    alt_throttle_adjust = altitude_hold_throttle + (-1*alt_dif_dif*alt_d_gain + alt_difference[0]*alt_p_gain) - receiver_input[2];
+  } else {
+    alt_throttle_adjust = 0;
+  }
+  
+}
+
+void set_motor_limits() {
+  // Set HIGH and LOW levels for ESCs! (calibrate ESCs)
+  while (receiver_input[2] < 1900) {
+    digitalWrite(status_led, HIGH);
+  }
+  delay(250);
+
+  flash_LED();
+
+  for (int i = 0; i < 1500; i ++) {
+    PORTD |= B11110000;                                                 // Set digital port 4, 5, 6 and 7 high.
+    delayMicroseconds(receiver_input[2]);                               // Set HIGH threshold.
+    PORTD &= B00001111;                                                 // Set digital port 4, 5, 6 and 7 low.
+    delayMicroseconds(4000 - receiver_input[2]);
+  }
+  digitalWrite(status_led, LOW);
+}
+
+void print_waypoints() {
+  for (int i; i < gps_waypoints.size(); i ++) {
+    Serial.print(gps_waypoints[i][0]);
+    Serial.print(" ");
+    Serial.println(gps_waypoints[i][1]);
+  }
+}
 
 void print_motor_speeds() {
-  Serial.print(esc_1); Serial.print(" "); Serial.print(esc_2); Serial.print(" ");
-  Serial.print(esc_3); Serial.print(" "); Serial.print(esc_4); Serial.print(" ");
-  Serial.print(alt); Serial.print(" "); Serial.println(alt_set_point);
+  Serial.print(esc_1); Serial.print( ' ' ); Serial.print(esc_2); Serial.print( ' ' );
+  Serial.print(esc_3); Serial.print( ' ' ); Serial.print(esc_4); Serial.print( ' ' );
+  Serial.print(alt); Serial.print( ' ' ); Serial.println(alt_set_point);
+}
+
+void flash_LED() {
+  delay(50);
+
+  // Flash the LED
+  for (int i = 0; i < 3; i ++) {
+    digitalWrite(status_led, HIGH); delay(50); digitalWrite(status_led, LOW); delay(50);
+  }
+  for (int i = 0; i < 1500; i ++) {
+    PORTD |= B11110000;                                                 // Set digital port 4, 5, 6 and 7 high.
+    delayMicroseconds(receiver_input[2]);                               // Set HIGH threshold.
+    PORTD &= B00001111;                                                 // Set digital port 4, 5, 6 and 7 low.
+    delayMicroseconds(4000 - receiver_input[2]);
+  }
+  digitalWrite(status_led, LOW);
 }
 
 void calculate_pid() { 
@@ -585,38 +610,38 @@ void reset_controller() {
 
 }
 
-void get_gps_data() {
-  if (gps_home_latitude != 0) {
-    if (Serial.available()) {
-      if (gps.encode(Serial.read())) {
-        gps_latitude = gps.location.lat();
-        gps_longitude = gps.location.lng();
-        gps_speed = gps.speed.mph();
+void get_gps_data(bool add_waypoint) {
+  if (gps.available( Serial )) {
+    fix = gps.read();
+
+    if (fix.valid.location) {
+      gps_position[0] = (fix.longitude() / 180) * 0.5 * earth_equator_circ;
+      gps_position[1] = (fix.latitude() / 90) * 0.25 * earth_pole_circ;
+
+      if (add_waypoint) {
+        std::vector<float> temp_gps_location;
+        temp_gps_location.push_back(gps_position[0]);
+        temp_gps_location.push_back(gps_position[1]);
   
-        /* OTHER WAY TO CALC X, Y
-        gps_position[0] = (earth_radius + alt) * cos(gps_latitude*PI/180) * cos(gps_longitude*PI/180);
-        gps_position[1] = (earth_radius + alt) * cos(gps_latitude*PI/180) * sin(gps_longitude*PI/180); */
-  
-        gps_position[0] = (gps_longitude / 180) * 0.5 * earth_equator_circ;
-        gps_position[1] = (gps_latitude / 90) * 0.25 * earth_pole_circ;
-              
-        distance_to_home = gps.distanceBetween(gps_latitude, gps_longitude, gps_home_latitude, gps_home_longitude);
-        //distance_to_home = sqrt(pow((gps_position[0] - gps_home_position[0]), 2) + pow((gps_position[1] - gps_home_position[1]), 2));
-        //Serial.println(distance_to_home);
-        Serial.print(gps_latitude); Serial.print(" "); Serial.print(gps_longitude); Serial.print(" "); Serial.println(gps_speed);
+        gps_waypoints.push_back(temp_gps_location);
       }
+      distance_to_home = fix.location.DistanceKm( home ) * 1000;
+
+      //Serial.println(distance_to_home);
+      //Serial.print(fix.latitude()); Serial.print( ' ' );
+      //Serial.print(fix.longitude()); Serial.print( ' ' );
+      //Serial.println(fix.speed());
     }
   }
 }
 
 void calibrate_gyro_altimeter_gps() {
   // CALIBRATE GYRO!
-  
   for (int cal_int = 0; cal_int < 2000 ; cal_int ++) {                  // Run this code 2000 times
     if (cal_int % 125 == 0) {
       led_on = !led_on;                                                 // Light up the LED every 125 times
     }
-    if (led_on == true) {
+    if (led_on) {
       digitalWrite(status_led, HIGH);
     } else {
       digitalWrite(status_led, LOW);
@@ -653,30 +678,58 @@ void calibrate_gyro_altimeter_gps() {
   alt_from_accel = alt_from_baro; // start the accel alt at the level of the barometer alt!
 
   // Get a HOME position for gps stuff
-  bool get_home_pos = true;
   unsigned long gps_pos_attempt = millis();
-  while (get_home_pos == true) {
-    if (Serial.available()) {
-      if (gps.encode(Serial.read())) {
-        gps_home_latitude = gps.location.lat();
-        gps_home_longitude = gps.location.lng();
-        if (gps_home_latitude != 0 && gps_home_longitude != 0) {
-          Serial.print(gps_home_latitude); Serial.print(" "); Serial.println(gps_home_longitude);
-          get_home_pos = false;
-          use_gps = true;
+  Serial.print( F("Waiting for GPS signal...") );
+
+  while (not got_home_pos) {
+    if (gps.available(Serial)) { // reading from the Serial port (for now)
+      fix = gps.read();
+
+      if (fix.valid.location) {
+        home = fix.location;
+        Serial.print( home.latF() ); Serial.print( ' ' );
+        Serial.println( home.lonF() );
+        got_home_pos = true;
+        use_gps      = true;
+      } else {
+        led_on = !led_on;
+        if (led_on) {
+          digitalWrite(status_led, HIGH);
         } else {
-          Serial.println("Waiting for GPS signal...");
+          digitalWrite(status_led, LOW);
         }
+        Serial.print( '.' );
       }
-      // Give ESC's a 1000us pulse
-      PORTD |= B11110000;                                                 // Set digital poort 4, 5, 6 and 7 high.
-      delayMicroseconds(1000);                                            // Wait 1000us.
-      PORTD &= B00001111;                                                 // Set digital poort 4, 5, 6 and 7 low.
-      delayMicroseconds(3000);                                            // Delay 3000 micros to simulate the 250 Hz program loop
     }
+
+    // Give ESC's a 1000us pulse
+    PORTD |= B11110000;                                                 // Set digital poort 4, 5, 6 and 7 high.
+    delayMicroseconds(1000);                                            // Wait 1000us.
+    PORTD &= B00001111;                                                 // Set digital poort 4, 5, 6 and 7 low.
+    delayMicroseconds(3000);                                            // Delay 3000 micros to simulate the 250 Hz program loop
+    // Give it 5 seconds to connect to GPS, no more
     if (millis() - gps_pos_attempt > 5000) {
-      get_home_pos = false;
       use_gps = false;
+      break; // out of the while loop
     }
   }
+
+  if (got_home_pos) {
+    // Easy way to calc x, y - assume our Earth is flat
+    gps_home_position[0] = (home.lonF() / 180) * 0.5 * earth_equator_circ;
+    gps_home_position[1] = (home.latF() / 90) * 0.25 * earth_pole_circ;
+
+    std::vector<float> temp_gps_location;
+    temp_gps_location.push_back(gps_home_position[0]);
+    temp_gps_location.push_back(gps_home_position[1]);
+    gps_waypoints.push_back(temp_gps_location);
+    
+    Serial.print(gps_home_position[0], 6);
+    Serial.print(' ');
+    Serial.println(gps_home_position[1], 6);
+  } else {
+    Serial.print( F("Home position not available.") );
+  }
+  Serial.println( F("Quad is ready.") );
+  digitalWrite(status_led, LOW);
 }

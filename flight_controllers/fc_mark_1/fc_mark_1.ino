@@ -1,13 +1,10 @@
 /* FLIGHT CONTROLLER MARK ONE:
  *    This is the most simple flight controller. It uses only
- *    an MPU6050 sensor to auto level and respond to controller
+ *    the MPU6050 sensor to auto level and respond to controller
  *    input.
  */
 
-
-
 #include <Wire.h>
-#include <stdio.h>
 
 // Gyro stuff
 int gyro_x, gyro_y, gyro_z;
@@ -24,7 +21,7 @@ float angle_pitch_output, angle_roll_output, angle_yaw_output;
 // Motor speeds
 int esc_1, esc_2, esc_3, esc_4;
 
-// Motor speed timersT
+// Motor speed timers
 unsigned long timer_1, timer_2, timer_3, timer_4, esc_loop_timer;
 
 bool led_on;
@@ -78,8 +75,8 @@ int receiver_input[5];                                                  // Recei
          BACK      0 <- m_1 CCW
 
   List of Connections:
-  RX:   CH1 -> Digital Pin 2
-        CH2 -> Digital Pin 3
+  RX:   CH1 -> Digital Pin 8
+        CH2 -> Digital Pin 9
         CH3 -> Digital Pin 10
         CH4 -> Digital Pin 11
         CH5 -> Digital Pin 12
@@ -120,6 +117,7 @@ void setup() {
     digitalWrite(status_led, HIGH);
   } 
   delay(50);
+  Serial.println(receiver_input[2]);
   // Flash the LED
   for (int i = 0; i < 3; i ++) {
     digitalWrite(status_led, HIGH); delay(50); digitalWrite(status_led, LOW); delay(50);
@@ -133,13 +131,16 @@ void setup() {
   digitalWrite(status_led, LOW);
 
   // Calibrate everything
-  calibrate_gyro();
+  calibrate_gyro_altimeter_gps();
 
   loop_timer = micros();                                                // Reset the loop timer
   digitalWrite(status_led, LOW);
+
+  Serial.println("Quad is ready.");
 }
 
 void loop() {
+
   // 65.5 = 1 deg/sec (from MPU-6050 spec sheet) COMPLIMENTARY FILTER
   gyro_roll_input = (gyro_roll_input * 0.7) + ((gyro_x/65.5) * 0.3);    // Gyro PID input is in degrees/second
   gyro_pitch_input = (gyro_pitch_input * 0.7) + ((gyro_y/65.5) * 0.3);
@@ -204,11 +205,13 @@ void loop() {
      *  Pitch Up: creates negative PID value (move forwards, increase speed of 1, 2)
      *  Pitch Down: creates positive PID value (move backwards, increase speed of 3, 4)
      */
+
+    // default to throttle level but take into account PID settings!
     esc_1 = receiver_input[2] - pid_output_pitch + pid_output_roll + pid_output_yaw;
     esc_2 = receiver_input[2] - pid_output_pitch - pid_output_roll - pid_output_yaw;
     esc_3 = receiver_input[2] + pid_output_pitch - pid_output_roll + pid_output_yaw;
     esc_4 = receiver_input[2] + pid_output_pitch + pid_output_roll - pid_output_yaw;
-
+   
     // Keep motors running
     int keep_value = 1100;
     if (esc_1 < keep_value) esc_1 = keep_value;
@@ -229,6 +232,8 @@ void loop() {
     esc_3 = 1000;
     esc_4 = 1000;
   }
+
+  //print_motor_speeds();
 
   //Serial.println(micros() - loop_timer); // LOOP TIME
   if (micros() - loop_timer > 4050) {
@@ -265,6 +270,11 @@ void loop() {
 
 
 
+
+void print_motor_speeds() {
+  Serial.print(esc_1); Serial.print(" "); Serial.print(esc_2); Serial.print(" ");
+  Serial.print(esc_3); Serial.print(" "); Serial.println(esc_4);
+}
 
 void calculate_pid() { 
   // Roll calculations first:
@@ -377,18 +387,18 @@ ISR(PCINT0_vect) {
   // check which pin changed
 
   // CHANNEL 1 (yaw)
-  if (last_channel[0] == 0 && PIND & B00000100) {
+  if (last_channel[0] == 0 && PINB & B00000001) {
     last_channel[0] = 1;
     timer[1] = timer[0];
-  } else if (last_channel[0] == 1 && !(PIND & B00000100)) {
+  } else if (last_channel[0] == 1 && !(PINB & B00000001)) {
     last_channel[0] = 0;
     receiver_input[0] = timer[0] - timer[1];
   }
   // CHANNEL 2 (pitch)
-  if (last_channel[1] == 0 && PIND & B00001000) {
+  if (last_channel[1] == 0 && PINB & B00000010) {
     last_channel[1] = 1;
     timer[2] = timer[0];
-  } else if (last_channel[1] == 1 && !(PIND & B00001000)) {
+  } else if (last_channel[1] == 1 && !(PINB & B00000010)) {
     last_channel[1] = 0;
     receiver_input[1] = timer[0] - timer[2];
   }
@@ -420,6 +430,7 @@ ISR(PCINT0_vect) {
 }
 
 void gyro_signal_in() {
+
   gyro_x -= gyro_x_cal;                                                 // Subtract the offset calibration value from the raw gyro_x value
   gyro_y -= gyro_y_cal;                                                 // Subtract the offset calibration value from the raw gyro_y value
   gyro_z -= gyro_z_cal;                                                 // Subtract the offset calibration value from the raw gyro_z value
@@ -469,7 +480,7 @@ void reset_pid() {
   pid_last_yaw_d_error = 0;
 }
 
-void calibrate_gyro() {
+void calibrate_gyro_altimeter_gps() {
   // CALIBRATE GYRO!
   for (int cal_int = 0; cal_int < 2000 ; cal_int ++) {                  // Run this code 2000 times
     if (cal_int % 125 == 0) {
